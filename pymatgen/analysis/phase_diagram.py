@@ -6,29 +6,28 @@
 This module defines tools to generate and analyze phase diagrams.
 """
 
-import re
 import collections
 import itertools
-import math
-import logging
-import os
 import json
+import logging
+import math
+import os
+import re
 from functools import lru_cache
 
 import numpy as np
+import pandas as pd
+import plotly.graph_objs as go
+from monty.json import MontyDecoder, MSONable
 from scipy.spatial import ConvexHull
 
-from monty.json import MSONable, MontyDecoder
-
-import plotly.graph_objs as go
-
-from pymatgen.core.composition import Composition
-from pymatgen.core.periodic_table import Element, DummySpecie, get_el_sp
-from pymatgen.util.coord import Simplex, in_coord_list
-from pymatgen.util.string import latexify
-from pymatgen.util.plotting import pretty_plot
 from pymatgen.analysis.reaction_calculator import Reaction, ReactionError
+from pymatgen.core.composition import Composition
+from pymatgen.core.periodic_table import DummySpecie, Element, get_el_sp
 from pymatgen.entries import Entry
+from pymatgen.util.coord import Simplex, in_coord_list
+from pymatgen.util.plotting import pretty_plot
+from pymatgen.util.string import latexify
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +35,7 @@ logger = logging.getLogger(__name__)
 with open(
     os.path.join(os.path.dirname(__file__), "..", "util", "plotly_pd_layouts.json")
 ) as f:
-    plotly_layouts = json.load(f)
+    _PLOTLY_LAYOUTS = json.load(f)
 
 
 class PDEntry(Entry):
@@ -1437,8 +1436,9 @@ class PDPlotter:
                 e_hull < show_unstable (eV/atom) will be shown.
             backend (str): Python package used for plotting ("matplotlib" or
                 "plotly"). Defaults to "plotly".
-            **plotkwargs (dict): Keyword args passed to matplotlib.pyplot.plot. Can
-                be used to customize markers etc. If not set, the default is
+            **plotkwargs (dict): If backend is matplotlib, kwargs passed to
+                matplotlib.pyplot.plot. Can be used to customize markers etc.
+                If not set, the default is
                 {
                     "markerfacecolor": (0.2157, 0.4941, 0.7216),
                     "markersize": 10,
@@ -1450,8 +1450,8 @@ class PDPlotter:
 
         self._pd = phasediagram
         self._dim = len(self._pd.elements)
-        if self._dim > 4:
-            raise ValueError("Only 1-4 components supported!")
+        if self._dim > 4 and backend == "matplotlib":
+            raise ValueError("Only 1-4 components supported with matplotlib, try plotly backend")
         self.lines = (
             uniquelines(self._pd.facets)
             if self._dim > 1
@@ -1543,12 +1543,18 @@ class PDPlotter:
         process_attributes=False,
         plt=None,
         label_uncertainties=False,
+        ternary_mode="3D",
+        highlight_entry=None,
+        show_legend=True
     ):
         """
+        Retrieve a plot showing the PhaseDiagram. Not all features are supported
+        by both backends, read specific keyword args for more information.
+
         :param label_stable: Whether to label stable compounds.
         :param label_unstable: Whether to label unstable compounds.
         :param ordering: Ordering of vertices (matplotlib backend only).
-        :param energy_colormap: Colormap for coloring energy (matplotlib backend only).
+        :param energy_colormap: Colormap for coloring energy.
         :param process_attributes: Whether to process the attributes (matplotlib
             backend only).
         :param plt: Existing plt object if plotting multiple phase diagrams (
@@ -1556,11 +1562,36 @@ class PDPlotter:
         :param label_uncertainties: Whether to add error bars to the hull (plotly
             backend only). For binaries, this also shades the hull with the
             uncertainty window.
+        :param ternary_mode: If a ternary phase diagram and using the plotly
+            backend, can set to "3D" (default) or "2D"
+        :param highlight_entry: If an Entry is provided, it will be highlighted on
+            the phase diagram with a star, only supported with plotly backend
         :return: go.Figure (plotly) or matplotlib.pyplot (matplotlib)
         """
         fig = None
 
         if self.backend == "plotly":
+
+            if self._dim > 4:
+                return self._create_plotly_radviz(
+                    self._pd,
+                    energy_colormap=energy_colormap,
+                    show_legend=show_legend,
+                    show_unstable=self.show_unstable,
+                    highlight_entry=highlight_entry
+                )
+
+            if self._dim == 1:
+                return self._create_plotly_dim_1(
+                    self._pd,
+                    energy_colormap=energy_colormap,
+                    highlight_entry=highlight_entry
+                )
+
+            if (self._dim == 3) and ternary_mode == '2D':
+                pass
+                #return self._create_plotly_ternary_2d()
+
             data = [self._create_plotly_lines()]
 
             if self._dim == 3:
@@ -1568,8 +1599,8 @@ class PDPlotter:
                 data.append(self._create_plotly_ternary_hull())
 
             stable_labels_plot = self._create_plotly_stable_labels(label_stable)
-            stable_marker_plot, unstable_marker_plot = self._create_plotly_markers(
-                label_uncertainties
+            stable_marker_plot, unstable_marker_plot, highlight_plot = self._create_plotly_markers(
+                label_uncertainties, energy_colormap=energy_colormap, highlight_entry=highlight_entry
             )
 
             if self._dim == 2 and label_uncertainties:
@@ -1581,6 +1612,7 @@ class PDPlotter:
 
             fig = go.Figure(data=data)
             fig.layout = self._create_plotly_figure_layout()
+            fig.update_layout(showlegend=show_legend)
 
         elif self.backend == "matplotlib":
             if self._dim <= 3:
@@ -1594,6 +1626,9 @@ class PDPlotter:
                 )
             elif self._dim == 4:
                 fig = self._get_3d_plot(label_stable)
+            elif self._dim > 4:
+                raise ValueError("Plotting of phase diagrams of higher than "
+                                 "4 dimensions not supported with matplotlib backend.")
 
         return fig
 
@@ -1722,8 +1757,8 @@ class PDPlotter:
                 for x, y in lines:
                     plt.plot(x, y, "ko-", **self.plotkwargs)
         else:
-            from matplotlib.colors import Normalize, LinearSegmentedColormap
             from matplotlib.cm import ScalarMappable
+            from matplotlib.colors import LinearSegmentedColormap, Normalize
 
             for x, y in lines:
                 plt.plot(x, y, "k-", markeredgecolor="k")
@@ -1901,7 +1936,7 @@ class PDPlotter:
 
     def _get_3d_plot(self, label_stable=True):
         """
-        Shows the plot using pylab.  Usually I won"t do imports in methods,
+        Shows the plot using pylab.  Usually I won't do imports in methods,
         but since plotting is a fairly expensive library to load and not all
         machines have matplotlib installed, I have done it this way.
         """
@@ -2090,8 +2125,8 @@ class PDPlotter:
         Returns:
             A matplotlib plot object.
         """
-        from scipy import interpolate
         from matplotlib import cm
+        from scipy import interpolate
 
         pd = self._pd
         entries = pd.qhull_entries
@@ -2169,7 +2204,7 @@ class PDPlotter:
 
     def _create_plotly_stable_labels(self, label_stable=True):
         """
-        Creates a (hidable) scatter trace containing labels of stable phases.
+        Creates a (hideable) scatter trace containing labels of stable phases.
         Contains some functionality for creating sensible label positions.
 
         :return: go.Scatter (or go.Scatter3d) plot
@@ -2273,7 +2308,7 @@ class PDPlotter:
                 font_dict = {"color": "#000000", "size": 24.0}
                 opacity = 1.0
 
-            annotation = plotly_layouts["default_annotation_layout"].copy()
+            annotation = _PLOTLY_LAYOUTS["default_annotation_layout"].copy()
             annotation.update(
                 {
                     "x": x,
@@ -2316,24 +2351,31 @@ class PDPlotter:
             annotations_list = self._create_plotly_element_annotations()
 
         if self._dim == 2:
-            layout = plotly_layouts["default_binary_layout"].copy()
+            layout = _PLOTLY_LAYOUTS["default_binary_layout"].copy()
             layout["annotations"] = annotations_list
         elif self._dim == 3:
-            layout = plotly_layouts["default_ternary_layout"].copy()
+            layout = _PLOTLY_LAYOUTS["default_ternary_layout"].copy()
             layout["scene"].update({"annotations": annotations_list})
         elif self._dim == 4:
-            layout = plotly_layouts["default_quaternary_layout"].copy()
+            layout = _PLOTLY_LAYOUTS["default_quaternary_layout"].copy()
             layout["scene"].update({"annotations": annotations_list})
 
         return layout
 
-    def _create_plotly_markers(self, label_uncertainties=False):
+    def _create_plotly_markers(self, label_uncertainties=False, energy_colormap=None, highlight_entry=None):
         """
         Creates stable and unstable marker plots for overlaying on the phase diagram.
 
         :return: Tuple of Plotly go.Scatter (or go.Scatter3d) objects in order: (
             stable markers, unstable markers)
         """
+
+        if energy_colormap:
+            stable_color = energy_colormap[0]
+            unstable_colorscale = energy_colormap
+        else:
+            stable_color = "darkgreen"
+            unstable_colorscale = _PLOTLY_LAYOUTS["unstable_colorscale"]
 
         def get_marker_props(coords, entries, stable=True):
             """ Method for getting marker locations, hovertext, and error bars
@@ -2346,7 +2388,7 @@ class PDPlotter:
                 entry_id = getattr(entry, "entry_id", "no ID")
                 formula = entry.composition.reduced_formula
                 clean_formula = self._htmlize_formula(formula)
-                label = f"{clean_formula} ({entry_id}) <br> " f"{energy} eV/atom"
+                label = f"{clean_formula} ({entry_id}) <br> {energy} eV/atom"
 
                 if not stable:
                     e_above_hull = round(self._pd.get_e_above_hull(entry), 3)
@@ -2402,14 +2444,14 @@ class PDPlotter:
         stable_markers, unstable_markers = dict(), dict()
 
         if self._dim == 2:
-            stable_markers = plotly_layouts["default_binary_marker_settings"].copy()
+            stable_markers = _PLOTLY_LAYOUTS["default_binary_marker_settings"].copy()
             stable_markers.update(
                 dict(
                     x=list(stable_props["x"]),
                     y=list(stable_props["y"]),
                     name="Stable",
                     marker=dict(
-                        color="darkgreen", size=11, line=dict(color="black", width=2)
+                        color=stable_color, size=11, line=dict(color="black", width=2)
                     ),
                     opacity=0.9,
                     hovertext=stable_props["texts"],
@@ -2423,7 +2465,7 @@ class PDPlotter:
                 )
             )
 
-            unstable_markers = plotly_layouts["default_binary_marker_settings"].copy()
+            unstable_markers = _PLOTLY_LAYOUTS["default_binary_marker_settings"].copy()
             unstable_markers.update(
                 dict(
                     x=list(unstable_props["x"]),
@@ -2431,7 +2473,7 @@ class PDPlotter:
                     name="Above Hull",
                     marker=dict(
                         color=unstable_props["energies"],
-                        colorscale=plotly_layouts["unstable_colorscale"],
+                        colorscale=unstable_colorscale,
                         size=6,
                         symbol="diamond",
                     ),
@@ -2440,7 +2482,7 @@ class PDPlotter:
             )
 
         elif self._dim == 3:
-            stable_markers = plotly_layouts["default_ternary_marker_settings"].copy()
+            stable_markers = _PLOTLY_LAYOUTS["default_ternary_marker_settings"].copy()
             stable_markers.update(
                 dict(
                     x=list(stable_props["y"]),
@@ -2449,7 +2491,7 @@ class PDPlotter:
                     name="Stable",
                     opacity=0.9,
                     marker=dict(
-                        color="darkgreen", size=8.5, line=dict(color="black", width=3)
+                        color=stable_color, size=20, line=dict(color="black", width=3)
                     ),
                     hovertext=stable_props["texts"],
                     error_z=dict(
@@ -2462,7 +2504,7 @@ class PDPlotter:
                 )
             )
 
-            unstable_markers = plotly_layouts["default_ternary_marker_settings"].copy()
+            unstable_markers = _PLOTLY_LAYOUTS["default_ternary_marker_settings"].copy()
             unstable_markers.update(
                 dict(
                     x=unstable_props["y"],
@@ -2471,7 +2513,7 @@ class PDPlotter:
                     name="Above Hull",
                     marker=dict(
                         color=unstable_props["energies"],
-                        colorscale=plotly_layouts["unstable_colorscale"],
+                        colorscale=unstable_colorscale,
                         size=4.2,
                         symbol="diamond",
                         colorbar=dict(
@@ -2483,7 +2525,7 @@ class PDPlotter:
             )
 
         elif self._dim == 4:
-            stable_markers = plotly_layouts["default_quaternary_marker_settings"].copy()
+            stable_markers = _PLOTLY_LAYOUTS["default_quaternary_marker_settings"].copy()
             stable_markers.update(
                 dict(
                     x=stable_props["x"],
@@ -2491,16 +2533,16 @@ class PDPlotter:
                     z=stable_props["z"],
                     name="Stable",
                     marker=dict(
-                        color=stable_props["energies"],
-                        colorscale=plotly_layouts["stable_markers_colorscale"],
-                        size=8,
+                        color=stable_color,
+                        size=8.5,
                         opacity=0.9,
+                        line=dict(color="black", width=3)
                     ),
                     hovertext=stable_props["texts"],
                 )
             )
 
-            unstable_markers = plotly_layouts[
+            unstable_markers = _PLOTLY_LAYOUTS[
                 "default_quaternary_marker_settings"
             ].copy()
             unstable_markers.update(
@@ -2511,7 +2553,7 @@ class PDPlotter:
                     name="Above Hull",
                     marker=dict(
                         color=unstable_props["energies"],
-                        colorscale=plotly_layouts["unstable_colorscale"],
+                        colorscale=unstable_colorscale,
                         size=5,
                         symbol="diamond",
                         colorbar=dict(
@@ -2534,7 +2576,23 @@ class PDPlotter:
             else go.Scatter3d(**unstable_markers)
         )
 
-        return stable_marker_plot, unstable_marker_plot
+        highlight_plot = None
+        if highlight_entry:
+            if self._dim == 2:
+                highlight_plot = go.Scatter(
+                    x=,
+                    y=,
+                    hovertext=,
+                    marker=,
+                    name="Highlighted Entry",
+                    showlegend=False
+                )
+            else:
+                highlight_plot = go.Scatter3d(
+
+                )
+
+        return stable_marker_plot, unstable_marker_plot, highlight_plot
 
     def _create_plotly_uncertainty_shading(self, stable_marker_plot):
         """
@@ -2637,14 +2695,372 @@ class PDPlotter:
             k=list(facets[:, 2]),
             opacity=0.8,
             intensity=list(energies),
-            colorscale=plotly_layouts["stable_colorscale"],
+            colorscale=_PLOTLY_LAYOUTS["stable_colorscale"],
             colorbar=dict(title="Formation energy<br>(eV/atom)", x=0.9, len=0.75),
             hoverinfo="none",
             lighting=dict(diffuse=0.0, ambient=1.0),
             name="Convex Hull (shading)",
             flatshading=True,
-            showlegend=True,
         )
+
+    @staticmethod
+    def _create_plotly_dim_1(phasediagram, show_unstable=0.2, energy_colormap=None,
+                             highlight_entry=None):
+        """
+        Create a simple 1D plot based on structure energies.
+
+        :param phasediagram: Input PhaseDiagram
+
+        :return: go.Figure
+        """
+
+        if energy_colormap:
+            unstable_colorscale = energy_colormap
+        else:
+            unstable_colorscale = _PLOTLY_LAYOUTS["unstable_colorscale"]
+
+        x = []
+        y = []
+        text = []
+        color = []
+
+        for entry in phasediagram.all_entries:
+
+            hull = phasediagram.get_e_above_hull(entry)
+
+            if hull <= show_unstable:
+
+                energy = round(phasediagram.get_form_energy_per_atom(entry), 3)
+
+                entry_id = getattr(entry, "entry_id", "no ID")
+                formula = entry.composition.reduced_formula
+                clean_formula = PDPlotter._htmlize_formula(formula)
+                label = f"{clean_formula} ({entry_id}) <br> {energy} eV/atom"
+
+                x.append(0)
+                y.append(energy)
+                text.append(label)
+                color.append(hull)
+
+        traces = [go.Scatter(x=x,
+                           y=y,
+                           text=text,
+                           mode="markers",
+                           marker={"color": color, "colorscale": unstable_colorscale, "size": 20,
+                                   "symbol": "line-ew", "line": {"width": 2, "color": y, "colorscale": unstable_colorscale}},
+                           hoverinfo="text",
+                           )]
+
+        if highlight_entry:
+
+            energy = round(phasediagram.get_form_energy_per_atom(highlight_entry), 3)
+
+            entry_id = getattr(highlight_entry, "entry_id", "no ID")
+            formula = highlight_entry.composition.reduced_formula
+            clean_formula = PDPlotter._htmlize_formula(formula)
+            label = f"{clean_formula} ({entry_id}) <br> {energy} eV/atom"
+
+            star_trace = go.Scatter(
+                x=[0],
+                y=[energy],
+                text=[label],
+                mode="markers",
+                marker={"color": "#fffacd", "size": 20,
+                        "symbol": "star", "line": {"width": 2, "color": "black"}},
+                hoverinfo="text",
+            )
+            traces.append(star_trace)
+
+        layout = _PLOTLY_LAYOUTS["default_unary_layout"].copy()
+
+        fig = go.Figure(data=traces, layout=layout)
+
+        return fig
+
+
+    @staticmethod
+    def _create_plotly_dim_3(phasediagram, show_unstable=0.2):
+
+        a = []
+        b = []
+        c = []
+        text = []
+        color = []
+
+        el = phasediagram.elements
+
+        for entry in phasediagram.all_entries:
+
+            hull = phasediagram.get_e_above_hull(entry)
+
+            if hull <= show_unstable:
+
+                energy = round(phasediagram.get_form_energy_per_atom(entry), 3)
+
+                entry_id = getattr(entry, "entry_id", "no ID")
+                formula = entry.composition.reduced_formula
+                clean_formula = PDPlotter._htmlize_formula(formula)
+                label = f"{clean_formula} ({entry_id}) <br> {energy} eV/atom"
+
+                a =
+
+                text.append(label)
+                color.append(hull)
+
+
+        ternary_points_trace = go.Scatterternary(
+            {
+                "mode": "markers",
+                "a": ,
+                "b": ...,
+                "c": ...,
+                "text": ...,
+                "marker": {
+                    "symbol": 100,
+                    "color": ...,
+                    "size": ...,
+                    "line": {"width": 2},
+                },
+            }
+        )
+
+        ternary_line_trace = go.Scatterternary({"mode": "lines", "a": ..., "b": ..., "c": ..., "line": ...})
+
+        traces = [ternary_points_trace, ternary_line_trace]
+
+        layout = go.Layout(
+            {
+                "title": "Ternary Scatter Plot",
+                "ternary": {
+                    "sum": 1,
+                    "aaxis": {
+                        "title": "X",
+                        "min": 0.01,
+                        "linewidth": 2,
+                        "ticks": "outside",
+                    },
+                    "baxis": {
+                        "title": "W",
+                        "min": 0.01,
+                        "linewidth": 2,
+                        "ticks": "outside",
+                    },
+                    "caxis": {
+                        "title": "S",
+                        "min": 0.01,
+                        "linewidth": 2,
+                        "ticks": "outside",
+                    },
+                },
+                "showlegend": False,
+            }
+        )
+
+        return go.Figure(data=traces, layout=layout)
+
+    @staticmethod
+    def _create_plotly_dim_5_plus_radviz(phasediagram, line_color="rgba(240,240,240,1)",
+                                         background_color="rgba(230,230,230,1)", show_unstable=0.2,
+                                         energy_colormap=None, show_legend=True, highlight_entry=None):
+        """
+        For > 4 dimensions there is no way to plot a phase diagram without
+        some form of dimensionality reduction, all of which have different
+        trade-offs. Radviz is one form of visualization that results in
+        each element being equally spaced around the circumference of a
+        circle with a given point in phase-space "pulled" as if by a
+        spring towards each element, with the strength of each spring related
+        to the fractional amount of each element that makes up that point.
+
+        Radviz is a natural fit for phase diagrams since it naturally displays
+        points in the range [0, 1], which is already the domain of fractional
+        composition.
+
+        More information on the Radviz technique in Hoffman et al. (1997),
+        this implementation is based on the Radviz implementation in pandas.
+
+        :param phasediagram: Build RadViz from a PhaseDiagram
+
+        :return: go.Figure
+        """
+
+        # Radviz implementation inspired by that found in pandas for matplotlib
+        # https://github.com/pandas-dev/pandas/blob/
+        # 675a54164f444eea051e50285e8ba9fab061fd14/pandas/plotting/_matplotlib/misc.py#L126
+        # License of original pandas code is as follows:
+        # BSD 3-Clause License
+        # Copyright (c) 2008-2011, AQR Capital Management, LLC, Lambda Foundry, Inc. and PyData Development Team
+        # Copyright (c) 2011-2020, Open source contributors.
+
+        if energy_colormap:
+            stable_color = energy_colormap[0]
+            unstable_colorscale = energy_colormap
+        else:
+            stable_color = "darkgreen"
+            unstable_colorscale = _PLOTLY_LAYOUTS["unstable_colorscale"]
+
+        # TODO: show number of elements with marker symbol
+        # symbols = {
+        #     2: "circle",
+        #     3: "triangle-up",
+        #     4: "diamond",  # or square
+        #     5: "pentagon",
+        #     6: "hexagon"
+        # }
+        # symbol_fallback = "asterisk"
+
+        # construct a DataFrame that stores fractional co-ordinates needed
+        records = []
+        for e in phasediagram.all_entries:
+            e_hull = phasediagram.get_e_above_hull(e)
+            record = {"stable": e_hull == 0}
+            if show_unstable and e_hull < show_unstable:
+                for el in phasediagram.elements:
+                    record[str(el)] = e.composition.fractional_composition.get(str(el), 0)
+                records.append(record)
+        frame = pd.DataFrame(records)
+
+        def normalize(series):
+            a = min(series)
+            b = max(series)
+            return (series - a) / (b - a)
+
+        class_column = "stable"
+        n = len(frame)
+        classes = frame[class_column].drop_duplicates()
+        class_col = frame[class_column]
+        df = frame.drop(class_column, axis=1).apply(normalize)
+
+        to_plot = {}
+
+        for kls in classes:
+            # x, y, e_above_hulls, labels, nelements
+            to_plot[kls] = [[], [], [], [], []]
+        if highlight_entry:
+            to_plot["highlight"] = [[], [], [], [], []]
+
+        m = len(frame.columns) - 1
+        s = np.array(
+            [
+                # reference implementation was (np.cos(t), np.sin(t))
+                # which always results in a point at (1, 0)
+                # however, looks more visually pleasing if point always
+                # at (0, 1) instead
+                (np.sin(t), np.cos(t))
+                for t in [2.0 * np.pi * (i / float(m)) for i in range(m)]
+            ]
+        )
+
+        def get_label(entry):
+            entry_id = getattr(entry, "entry_id", "no ID")
+            return "{} ({})".format(entry.composition.reduced_formula, entry_id)
+
+        for i in range(n):
+            row = df.iloc[i].values
+            row_ = np.repeat(np.expand_dims(row, axis=1), 2, axis=1)
+            y = (s * row_).sum(axis=0) / row.sum()
+            kls = class_col.iat[i]
+            # x, y, e_above_hulls, labels, nelements
+            if phasediagram.all_entries[i] == highlight_entry:
+                kls = "highlight"
+            to_plot[kls][0].append(y[0])
+            to_plot[kls][1].append(y[1])
+            to_plot[kls][2].append(phasediagram.get_e_above_hull(phasediagram.all_entries[i]))
+            to_plot[kls][3].append(get_label(phasediagram.all_entries[i]))
+            to_plot[kls][4].append(len(phasediagram.all_entries[i].composition.elements))
+
+        traces = []
+        for i, (kls, plot_data) in enumerate(to_plot.items()):
+            # In principle, Radviz can handle multiple classes of data
+            # Here, we just use a single class ("stable") which is either
+            # True or False. If False, the entry is off the hull and
+            # can be color-coded by its energy above hull or formation energy.
+            # A third class, "highlight", is used to place a star to highlight
+            # a specific entry.
+            if kls is True:
+                trace = go.Scatter(
+                    x=plot_data[0],
+                    y=plot_data[1],
+                    mode="markers",
+                    marker={
+                        "color": stable_color,
+                        "line": dict(color="black", width=2)
+                    },
+                    text=plot_data[3],
+                    hoverinfo="text",
+                    name="Stable"
+                )
+            elif kls == "highlight":
+                trace = go.Scatter(
+                    x=plot_data[0],
+                    y=plot_data[1],
+                    mode="markers",
+                    marker={"color": "#fffacd", "size": 20,
+                            "symbol": "star", "line": {"width": 2, "color": "black"}},
+                    text=plot_data[3],
+                    hoverinfo="text",
+                    showlegend=False,
+                    name="Highlighted Entry"
+                )
+            else:
+                trace = go.Scatter(
+                    x=plot_data[0],
+                    y=plot_data[1],
+                    mode="markers",
+                    marker={"color": plot_data[2], "colorscale": unstable_colorscale},
+                    text=plot_data[3],
+                    hoverinfo="text",
+                    name="Above Hull"
+                )
+            traces.append(trace)
+
+        # TODO: add color bar
+
+        endpoint_trace = go.Scatter(
+            x=[p[0] for p in s],
+            y=[p[1] for p in s],
+            mode="markers+text",
+            marker={"size": 20, "color": background_color},
+            text=list(df.columns),
+            showlegend=False,
+            hoverinfo=None
+        )
+
+        traces.append(endpoint_trace)
+
+        radius = {
+            "type": "circle",
+            "xref": "x",
+            "yref": "y",
+            "fillcolor": background_color,
+            "line_color": line_color,
+            "x0": -1,
+            "y0": -1,
+            "x1": 1,
+            "y1": 1,
+            "layer": "below"
+        }
+
+        if show_legend:
+            margin = {"l": 0, "r": 50, "b": 0, "t": 0}
+        else:
+            margin = {"l": 0, "r": 0, "b": 0, "t": 0}
+
+        layout = {
+            "xaxis": {"visible": False},
+            "yaxis": {"scaleanchor": "x", "scaleratio": 1, "visible": False},
+            "paper_bgcolor": "rgba(0,0,0,0)",
+            "plot_bgcolor": "rgba(0,0,0,0)",
+            "shapes": [radius],
+            "width": 500,
+            "height": 500,
+            "margin": margin,
+        }
+
+        fig = go.Figure(data=traces, layout=layout)
+
+        fig.update_layout(showlegend=show_legend)
+
+        return fig
 
     @staticmethod
     def _htmlize_formula(formula: str):
